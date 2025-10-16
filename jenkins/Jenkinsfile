@@ -1,1 +1,121 @@
+pipeline {
+  agent any
+
+  environment {
+    AWS_REGION     = "us-east-1"
+    ECR_REPO       = "private-eks-webapp-repo"
+    EKS_CLUSTER    = "private-eks-cluster"
+    APP_NAME       = "html-webapp"
+    TF_DIR         = "terraform"
+    IMAGE_TAG      = "${env.BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build & Push Docker Image') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            echo ">>> Logging in to ECR..."
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $(aws sts get-caller-identity --query 'Account' --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+            echo ">>> Building Docker image..."
+            docker build -t $ECR_REPO:$IMAGE_TAG ./app
+
+            echo ">>> Tagging & pushing image to ECR..."
+            ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+            docker tag $ECR_REPO:$IMAGE_TAG $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+            docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+          '''
+        }
+      }
+    }
+
+    stage('Terraform Apply Infra') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          dir("${env.TF_DIR}") {
+            sh '''
+              echo ">>> Initializing Terraform..."
+              terraform init -backend-config="bucket=tfstate-eks-private-prod" \
+                             -backend-config="key=eks-private/terraform.tfstate" \
+                             -backend-config="region=$AWS_REGION" \
+                             -backend-config="dynamodb_table=terraform-locks" \
+                             -backend-config="encrypt=true"
+
+              echo ">>> Planning Terraform changes..."
+              terraform plan -out=tfplan
+
+              echo ">>> Applying Terraform changes..."
+              terraform apply -auto-approve tfplan
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Deploy to EKS') {
+      steps {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            echo ">>> Generating kubeconfig..."
+            ./scripts/generate_kubeconfig.sh kubeconfig
+            export KUBECONFIG=$(pwd)/kubeconfig
+
+            echo ">>> Deploying HTML app to EKS..."
+            ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+            cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $APP_NAME
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: $APP_NAME
+  template:
+    metadata:
+      labels:
+        app: $APP_NAME
+    spec:
+      containers:
+      - name: $APP_NAME
+        image: $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $APP_NAME-service
+spec:
+  selector:
+    app: $APP_NAME
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+EOF
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "✅ Pipeline completed successfully — App deployed on EKS via private ALB!"
+    }
+    failure {
+      echo "❌ Deployment failed. Check Jenkins logs."
+    }
+  }
+}
 
